@@ -1,4 +1,24 @@
-venv/
+# Python
 __pycache__/
 *.pyc
+
+# Virtual environments
+venv/
+venv310/
+
+# Paddle cache
+.paddlex_cache/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs / temp
+*.log
+
+
+# Model weights
 *.pt
+
+# Output data
+data/output/
