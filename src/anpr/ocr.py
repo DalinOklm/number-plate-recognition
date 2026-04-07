@@ -65,7 +65,7 @@ class PlateOCR:
             lang="en",
         )
         LOGGER.info("PaddleOCR running in CPU safe mode (MKLDNN disabled)")
-        LOGGER.info("Using PaddleOCR successfully")
+        LOGGER.info("PaddleOCR running successfully (stable version)")
 
     def extract_text(self, processed_plate: PreprocessedPlate) -> OCRResult:
         """Run multi-pass OCR and select the strongest merged plate string."""
@@ -169,41 +169,31 @@ class PlateOCR:
         """Run one PaddleOCR pass and normalize fragments."""
         LOGGER.debug("Running PaddleOCR on one image variant")
         paddle_input = self._prepare_image_for_paddle(image)
-        raw_result = self.reader.ocr(paddle_input)
+        result = self.reader.ocr(paddle_input)
         LOGGER.info("Running PaddleOCR pass successfully")
         LOGGER.debug("PaddleOCR completed successfully for one image variant")
 
         fragments: List[tuple[float, float, str]] = []
         confidences: List[float] = []
-        for box, text, confidence in self._iter_ocr_lines(raw_result):
-            cleaned_text = clean_plate_text(text)
-            if cleaned_text:
-                x_coordinate = float(box[0][0])
-                fragments.append((x_coordinate, float(confidence), cleaned_text))
-                confidences.append(float(confidence))
+        if isinstance(result, list):
+            for line_group in result:
+                if not line_group:
+                    continue
+                for line in line_group:
+                    if not isinstance(line, (list, tuple)) or len(line) < 2:
+                        continue
+                    box = line[0]
+                    text_info = line[1]
+                    if not isinstance(text_info, (list, tuple)) or len(text_info) < 2:
+                        continue
+                    text, confidence = text_info
+                    cleaned_text = clean_plate_text(str(text))
+                    if not cleaned_text:
+                        continue
+                    x_coordinate = float(box[0][0])
+                    fragments.append((x_coordinate, float(confidence), cleaned_text))
+                    confidences.append(float(confidence))
         return fragments, confidences
-
-    @staticmethod
-    def _iter_ocr_lines(raw_result: object) -> List[tuple[list, str, float]]:
-        """Normalize PaddleOCR output into box/text/confidence tuples."""
-        lines: List[tuple[list, str, float]] = []
-        if not isinstance(raw_result, list):
-            return lines
-
-        for page_result in raw_result:
-            if not page_result:
-                continue
-            for line in page_result:
-                if not isinstance(line, list) or len(line) < 2:
-                    continue
-                box = line[0]
-                text_info = line[1]
-                if not isinstance(text_info, (list, tuple)) or len(text_info) < 2:
-                    continue
-                text = str(text_info[0])
-                confidence = float(text_info[1])
-                lines.append((box, text, confidence))
-        return lines
 
 def clean_plate_text(text: str) -> str:
     """Normalize OCR output to alphanumeric plate characters only."""

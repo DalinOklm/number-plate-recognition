@@ -72,10 +72,8 @@ class ANPRPipeline:
         self.config.output_dir.mkdir(parents=True, exist_ok=True)
         annotated_dir = self.config.output_dir / "annotated"
         processed_dir = self.config.output_dir / "processed_plates"
-        trace_dir = self.config.output_dir / "process_traces"
         annotated_dir.mkdir(parents=True, exist_ok=True)
         processed_dir.mkdir(parents=True, exist_ok=True)
-        trace_dir.mkdir(parents=True, exist_ok=True)
 
         image_results: List[ImageResult] = []
         for image_path in image_paths:
@@ -84,10 +82,10 @@ class ANPRPipeline:
             if self.config.enable_process_trace:
                 trace_path = self.save_process_trace(
                     image_result=image_result,
-                    trace_dir=trace_dir,
+                    trace_dir=self.config.output_dir,
                 )
                 if trace_path is not None and self.config.enable_visualization:
-                    if not self.show_trace_image(trace_path):
+                    if not self.show_trace_image(trace_path, image_path.name):
                         LOGGER.info("Trace visualization interrupted by user request")
                         break
             if self.config.enable_visualization:
@@ -318,7 +316,14 @@ class ANPRPipeline:
             "Backend: PaddlePaddle 2.5.0",
             "Image Processing: OpenCV",
         ]
-        panels.append(self._make_text_panel(header_lines, "Global Header", height=220))
+        panels.append(
+            self._make_text_panel(
+                header_lines,
+                "Global Header",
+                height=220,
+                theme="header",
+            )
+        )
 
         overview = source_image.copy()
         cv2.putText(
@@ -347,7 +352,7 @@ class ANPRPipeline:
             cv2.rectangle(overview, (x1, y1), (x2, y2), color, 2)
             cv2.putText(
                 overview,
-                f"{self._model_display_name(detection.model_name)} | Conf: {detection.yolo_confidence:.2f}",
+                f"{detection.model_name} ({self._model_display_name(detection.model_name)}) | Conf: {detection.yolo_confidence:.2f}",
                 (x1, max(25, y1 - 8)),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.6,
@@ -362,6 +367,7 @@ class ANPRPipeline:
             panels.append(
                 self._make_text_panel(
                     [
+                        f"Technology: {detection.model_name} -> {model_display_name}",
                         f"Detection Model: {model_display_name}",
                         "Cropping: Bounding box extraction from YOLO detection",
                         "Preprocessing: OpenCV (cv2)",
@@ -371,6 +377,7 @@ class ANPRPipeline:
                         "PaddleOCR uses deep learning models executed by PaddlePaddle to recognize characters from images.",
                     ],
                     f"{model_display_name} Pipeline",
+                    theme="section",
                 )
             )
             x1, y1, x2, y2 = detection.bbox
@@ -379,6 +386,9 @@ class ANPRPipeline:
                 self._make_labeled_panel(
                     cropped_plate,
                     f"{model_display_name} Step 2: Cropped Plate",
+                    subtitle="Cropping: Bounding box extraction from YOLO detection",
+                    accent=detection.model_name,
+                    best_model_name=image_result.best_model_name,
                 )
             )
 
@@ -400,28 +410,34 @@ class ANPRPipeline:
                     self._make_labeled_panel(
                         processed_plate,
                         f"{model_display_name} Step 3: {variant_label}",
+                        subtitle="Preprocessing: OpenCV (cv2) | Techniques: grayscale / threshold / sharpening",
+                        accent=detection.model_name,
+                        best_model_name=image_result.best_model_name,
                     )
                 )
 
             ocr_lines = [
-                f"Final: {detection.text}",
-                f"YOLO: {detection.yolo_confidence:.2f}",
-                f"OCR: {detection.ocr_confidence:.2f}" if detection.ocr_confidence is not None else "OCR: n/a",
-                f"OCR Engine: {self._ocr_engine_label()}",
-                f"Deep Learning Backend: {self._backend_label()}",
+                f"Detection Model: {model_display_name}",
             ]
             for pass_result in detection.ocr_pass_results:
                 confidence_text = (
                     f"{pass_result.confidence:.2f}" if pass_result.confidence is not None else "n/a"
                 )
-                ocr_lines.append(
-                    f"{pass_result.pass_name}: {pass_result.text or 'EMPTY'} | Confidence: {confidence_text}"
-                )
+                status = "REJECTED" if pass_result.is_low_confidence or not pass_result.text else "CANDIDATE"
+                ocr_lines.append(f"Candidate ({pass_result.pass_name}) [{status}]")
+                ocr_lines.append(f"Text: {pass_result.text or 'EMPTY'}")
+                ocr_lines.append(f"Confidence: {confidence_text}")
+                ocr_lines.append(f"OCR Engine: {self._ocr_engine_label()}")
+                ocr_lines.append(f"Deep Learning Backend: {self._backend_label()}")
 
             panels.append(
                 self._make_text_panel(
                     ocr_lines,
                     f"{model_display_name} Step 4: OCR Outputs",
+                    theme="ocr",
+                    accent=detection.model_name,
+                    best_model_name=image_result.best_model_name,
+                    height=max(320, 92 + (len(ocr_lines) * 28)),
                 )
             )
 
@@ -433,10 +449,17 @@ class ANPRPipeline:
                 "Score = YOLO confidence + OCR confidence",
                 "Fusion logic: custom scoring pipeline",
             ]
+            if detection.comparison_score < 0.80:
+                decision_lines.append("LOW CONFIDENCE DETECTION")
+                decision_lines.append("Prediction may be unreliable")
             panels.append(
                 self._make_text_panel(
                     decision_lines,
                     f"{model_display_name} Step 5: Final Decision",
+                    theme="decision",
+                    accent=detection.model_name,
+                    best_model_name=image_result.best_model_name,
+                    confidence_score=detection.comparison_score,
                 )
             )
 
@@ -451,7 +474,7 @@ class ANPRPipeline:
         ]
         for detection in image_result.detections:
             comparison_lines.append(
-                f"{self._model_display_name(detection.model_name)} -> Score: {detection.comparison_score:.2f}"
+                f"{detection.model_name} -> Score: {detection.comparison_score:.2f}"
             )
         if image_result.best_model_name:
             best_result = next(
@@ -462,10 +485,16 @@ class ANPRPipeline:
                 ),
                 None,
             )
-            comparison_lines.append(f"Selected: {self._model_display_name(image_result.best_model_name)}")
+            comparison_lines.append(f"Selected: {image_result.best_model_name}")
             if best_result is not None:
                 comparison_lines.append(f"Final Plate: {best_result.text}")
-        panels.append(self._make_text_panel(comparison_lines, "FINAL COMPARISON"))
+        panels.append(
+            self._make_text_panel(
+                comparison_lines,
+                "FINAL COMPARISON",
+                theme="comparison",
+            )
+        )
 
         trace_image = self._stack_panels(panels, columns=2)
         trace_path = trace_dir / f"{image_result.image_path.stem}_trace.jpg"
@@ -473,7 +502,7 @@ class ANPRPipeline:
         LOGGER.info("Saved process trace to %s", trace_path)
         return trace_path
 
-    def show_trace_image(self, trace_path: Path) -> bool:
+    def show_trace_image(self, trace_path: Path, image_name: str) -> bool:
         """Display one process trace board."""
         trace_image = cv2.imread(str(trace_path))
         if trace_image is None:
@@ -486,7 +515,7 @@ class ANPRPipeline:
             fy=0.55,
             interpolation=cv2.INTER_AREA,
         )
-        cv2.imshow("ANPR Process Trace", display_image)
+        cv2.imshow(f"ANPR Process Trace - {image_name}", display_image)
         key = cv2.waitKey(0) & 0xFF
         return key != ord("q")
 
@@ -539,15 +568,16 @@ class ANPRPipeline:
     def _overlay_color(model_name: str, best_model_name: str | None) -> tuple[int, int, int]:
         """Return model-specific overlay color, highlighting the best result."""
         if model_name == best_model_name:
-            return (0, 0, 255)
-        if model_name == "Model1":
-            return (0, 255, 0)
-        return (255, 255, 0)
+            return (0, 180, 0)
+        return (0, 215, 255)
 
     @staticmethod
     def _make_labeled_panel(
         image: np.ndarray,
         title: str,
+        subtitle: str | None = None,
+        accent: str | None = None,
+        best_model_name: str | None = None,
         width: int = 640,
         height: int = 280,
     ) -> np.ndarray:
@@ -557,36 +587,100 @@ class ANPRPipeline:
         if len(image.shape) == 2:
             image = cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
         panel = np.full((height, width, 3), 255, dtype=np.uint8)
-        fitted = ANPRPipeline._fit_image(image, width - 20, height - 60)
+        border_color = ANPRPipeline._panel_color(accent, best_model_name)
+        cv2.rectangle(panel, (0, 0), (width - 1, height - 1), border_color, 3)
+        fitted = ANPRPipeline._fit_image(image, width - 20, height - 90)
         if len(fitted.shape) == 2:
             fitted = cv2.cvtColor(fitted, cv2.COLOR_GRAY2BGR)
-        y_offset = 45 + (height - 60 - fitted.shape[0]) // 2
+        y_offset = 70 + (height - 90 - fitted.shape[0]) // 2
         x_offset = (width - fitted.shape[1]) // 2
         panel[y_offset:y_offset + fitted.shape[0], x_offset:x_offset + fitted.shape[1]] = fitted
         cv2.putText(panel, title, (12, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.72, (35, 35, 35), 2, cv2.LINE_AA)
+        if subtitle:
+            cv2.putText(panel, subtitle[:88], (12, 54), cv2.FONT_HERSHEY_SIMPLEX, 0.58, (80, 80, 80), 1, cv2.LINE_AA)
         return panel
 
     @staticmethod
     def _make_text_panel(
         lines: List[str],
         title: str,
+        theme: str = "default",
+        accent: str | None = None,
+        best_model_name: str | None = None,
+        confidence_score: float | None = None,
         width: int = 640,
         height: int = 280,
     ) -> np.ndarray:
         """Create a text panel summarizing OCR pass outputs."""
         panel = np.full((height, width, 3), 255, dtype=np.uint8)
-        cv2.putText(panel, title, (12, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.72, (35, 35, 35), 2, cv2.LINE_AA)
+        header_color = ANPRPipeline._theme_header_color(theme, accent, best_model_name)
+        cv2.rectangle(panel, (0, 0), (width - 1, height - 1), header_color, 3)
+        cv2.rectangle(panel, (0, 0), (width - 1, 44), header_color, -1)
+        cv2.putText(panel, title, (12, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.72, (255, 255, 255), 2, cv2.LINE_AA)
         y_position = 60
         for line in lines:
             render_text = line
             render_color = (70, 70, 70)
-            if line.startswith("-"):
+            if "[REJECTED]" in line or "Text: EMPTY" in line:
+                render_color = (0, 0, 220)
+            elif line == "LOW CONFIDENCE DETECTION" or line == "Prediction may be unreliable":
+                render_color = (0, 0, 255)
+            elif line.startswith("Candidate"):
+                render_color = (0, 140, 200)
+            elif line.startswith("Final Plate") or line.startswith("Selected"):
+                render_color = (
+                    ANPRPipeline._confidence_color(confidence_score)
+                    if confidence_score is not None
+                    else (0, 150, 0)
+                )
+            elif line.startswith("Combined Score:"):
+                render_color = (
+                    ANPRPipeline._confidence_color(confidence_score)
+                    if confidence_score is not None
+                    else (70, 70, 70)
+                )
+            elif line.startswith("-"):
                 render_color = (30, 30, 30)
             cv2.putText(panel, render_text[:90], (12, y_position), cv2.FONT_HERSHEY_SIMPLEX, 0.58, render_color, 1, cv2.LINE_AA)
             y_position += 28
             if y_position > height - 12:
                 break
         return panel
+
+    @staticmethod
+    def _panel_color(model_name: str | None, best_model_name: str | None) -> tuple[int, int, int]:
+        """Return panel accent color using green/yellow/red semantics."""
+        if model_name is None:
+            return (120, 120, 120)
+        if model_name == best_model_name:
+            return (0, 180, 0)
+        return (0, 215, 255)
+
+    @staticmethod
+    def _theme_header_color(
+        theme: str,
+        accent: str | None,
+        best_model_name: str | None,
+    ) -> tuple[int, int, int]:
+        """Return a readable header color for one panel theme."""
+        if theme == "comparison":
+            return (50, 50, 50)
+        if theme == "header":
+            return (140, 90, 20)
+        if theme in {"section", "ocr", "decision"} and accent is not None:
+            return ANPRPipeline._panel_color(accent, best_model_name)
+        return (90, 90, 90)
+
+    @staticmethod
+    def _confidence_color(score: float | None) -> tuple[int, int, int]:
+        """Return a score-based color for final-decision emphasis."""
+        if score is None:
+            return (70, 70, 70)
+        if score >= 0.90:
+            return (0, 150, 0)
+        if score >= 0.80:
+            return (0, 215, 255)
+        return (0, 0, 255)
 
     @staticmethod
     def _fit_image(image: np.ndarray, max_width: int, max_height: int) -> np.ndarray:
@@ -600,13 +694,80 @@ class ANPRPipeline:
     @staticmethod
     def _stack_panels(panels: List[np.ndarray], columns: int) -> np.ndarray:
         """Arrange panels into a simple grid image."""
+        valid_panels: List[np.ndarray] = []
+        for panel in panels:
+            if panel is None or not isinstance(panel, np.ndarray) or panel.size == 0:
+                valid_panels.append(np.full((280, 640, 3), 255, dtype=np.uint8))
+                continue
+            if len(panel.shape) == 2:
+                panel = cv2.cvtColor(panel, cv2.COLOR_GRAY2BGR)
+            valid_panels.append(panel)
+
         rows: List[np.ndarray] = []
-        for index in range(0, len(panels), columns):
-            row = panels[index:index + columns]
+        for index in range(0, len(valid_panels), columns):
+            row = valid_panels[index:index + columns]
             if len(row) < columns:
                 row.extend([np.full_like(row[0], 255)] * (columns - len(row)))
-            rows.append(np.hstack(row))
-        return np.vstack(rows)
+            target_height = max(panel.shape[0] for panel in row)
+            normalized_row = [
+                ANPRPipeline._pad_to_height(panel, target_height) for panel in row
+            ]
+            rows.append(np.hstack(normalized_row))
+
+        if not rows:
+            return np.full((280, 640, 3), 255, dtype=np.uint8)
+
+        target_width = max(row.shape[1] for row in rows)
+        normalized_rows = [
+            ANPRPipeline._pad_to_width(row, target_width) for row in rows
+        ]
+        return np.vstack(normalized_rows)
+
+    @staticmethod
+    def _pad_to_height(image: np.ndarray, target_height: int) -> np.ndarray:
+        """Pad an image vertically to a target height without resizing content."""
+        if image is None or image.size == 0:
+            return np.full((target_height, 640, 3), 255, dtype=np.uint8)
+        if len(image.shape) == 2:
+            image = cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
+        if image.shape[0] >= target_height:
+            return image
+
+        missing = target_height - image.shape[0]
+        top = missing // 2
+        bottom = missing - top
+        return cv2.copyMakeBorder(
+            image,
+            top,
+            bottom,
+            0,
+            0,
+            cv2.BORDER_CONSTANT,
+            value=(255, 255, 255),
+        )
+
+    @staticmethod
+    def _pad_to_width(image: np.ndarray, target_width: int) -> np.ndarray:
+        """Pad an image horizontally to a target width without resizing content."""
+        if image is None or image.size == 0:
+            return np.full((280, target_width, 3), 255, dtype=np.uint8)
+        if len(image.shape) == 2:
+            image = cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
+        if image.shape[1] >= target_width:
+            return image
+
+        missing = target_width - image.shape[1]
+        left = missing // 2
+        right = missing - left
+        return cv2.copyMakeBorder(
+            image,
+            0,
+            0,
+            left,
+            right,
+            cv2.BORDER_CONSTANT,
+            value=(255, 255, 255),
+        )
 
     @staticmethod
     def _shrink_bbox(
