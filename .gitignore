@@ -16,6 +16,8 @@ Thumbs.db
 # Logs / temp
 *.log
 
+# Secrets
+.env
 
 # Model weights
 *.pt

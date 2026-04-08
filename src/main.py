@@ -85,6 +85,12 @@ def serialize_results(image_results: list) -> list[dict]:
                         "comparison_score": detection.comparison_score,
                         "processed_plate_path": detection.processed_plate_path,
                         "preprocess_variant_paths": detection.preprocess_variant_paths,
+                        "ocr_comparison": {
+                            "easyocr_text": detection.ocr_comparison.easyocr_text,
+                            "paddleocr_text": detection.ocr_comparison.paddleocr_text,
+                            "openai_text": detection.ocr_comparison.openai_text,
+                            "disagreement_detected": detection.ocr_comparison.disagreement_detected,
+                        },
                         "ocr_pass_results": [
                             {
                                 "pass_name": pass_result.pass_name,
@@ -148,6 +154,22 @@ def main() -> int:
         if not image_result.detections:
             print("  No license plates detected.")
             continue
+
+        selected_detection = next(
+            (
+                detection
+                for detection in image_result.detections
+                if detection.model_name == image_result.best_model_name
+            ),
+            image_result.detections[0],
+        )
+        print("------------------------------")
+        print(f"Model 1   : {selected_detection.ocr_comparison.easyocr_text}")
+        print(f"Model 2   : {selected_detection.ocr_comparison.paddleocr_text}")
+        print(f"Model 3   : {selected_detection.ocr_comparison.openai_text}")
+        print("------------------------------")
+        if selected_detection.ocr_comparison.disagreement_detected:
+            print("OCR disagreement detected")
 
         for detection in image_result.detections:
             print(f"[{detection.model_name}]")

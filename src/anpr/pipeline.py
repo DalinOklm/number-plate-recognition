@@ -10,12 +10,21 @@ import numpy as np
 
 from .config import ANPRConfig
 from .detection import MultiModelLicensePlateDetector, NamedPlateDetection
+from .openai_test import interpret_license_plate_image
 from .ocr import OCRPassResult, OCRResult, PlateOCR
 from .preprocessing import PreprocessedPlate, preprocess_plate_image
 
 
 SUPPORTED_IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 LOGGER = logging.getLogger(__name__)
+
+
+@dataclass(slots=True)
+class OCRComparisonResult:
+    easyocr_text: str
+    paddleocr_text: str
+    openai_text: str
+    disagreement_detected: bool
 
 
 @dataclass(slots=True)
@@ -32,6 +41,7 @@ class PlateDetectionResult:
     processed_plate_path: str
     preprocess_variant_paths: dict[str, str]
     ocr_pass_results: List[OCRPassResult]
+    ocr_comparison: OCRComparisonResult
 
 
 @dataclass(slots=True)
@@ -54,6 +64,7 @@ class ANPRPipeline:
             confidence_threshold=config.detection_confidence,
         )
         self.ocr = PlateOCR(config.ocr_languages)
+        self.easyocr_reader = self._initialize_easyocr_reader(config.ocr_languages)
 
     def process_directory(self, input_dir: Path | None = None) -> List[ImageResult]:
         """Process all supported images in a directory."""
@@ -89,6 +100,10 @@ class ANPRPipeline:
                         LOGGER.info("Trace visualization interrupted by user request")
                         break
             if self.config.enable_visualization:
+                if not self.show_ocr_comparison_window(image_result):
+                    LOGGER.info("OCR comparison visualization interrupted by user request")
+                    break
+            if self.config.enable_visualization:
                 if not self.visualize_result(
                     image_result=image_result,
                     annotated_dir=annotated_dir,
@@ -110,13 +125,34 @@ class ANPRPipeline:
         image = cv2.imread(str(image_path))
         if image is None:
             raise ValueError(f"Unable to read image: {image_path}")
+        return self.process_array(
+            image,
+            image_name=image_path.name,
+            image_path=image_path,
+        )
+
+    def process_array(
+        self,
+        image: np.ndarray,
+        image_name: str = "frame.jpg",
+        image_path: Path | None = None,
+        max_detections: int | None = None,
+        enable_comparison: bool = True,
+    ) -> ImageResult:
+        """Process one in-memory image and return all recognized license plates."""
         LOGGER.info("Loaded image successfully: %s shape=%s", image_path, image.shape)
 
         raw_detections = self.detector.detect(image)
+        raw_detections.sort(
+            key=lambda item: item.detection.confidence,
+            reverse=True,
+        )
+        if max_detections is not None:
+            raw_detections = raw_detections[:max_detections]
         LOGGER.info(
             "Detected %d model outputs in %s",
             len(raw_detections),
-            image_path.name,
+            image_name,
         )
         plate_results: List[PlateDetectionResult] = []
         processed_dir = self.config.output_dir / "processed_plates"
@@ -152,7 +188,12 @@ class ANPRPipeline:
                 named_detection.model_name,
                 detection.bbox,
             )
-            base_name = f"{image_path.stem}_{named_detection.model_name.lower()}_plate_{index}"
+            image_stem = (
+                image_path.stem
+                if image_path is not None
+                else Path(image_name).stem or "frame"
+            )
+            base_name = f"{image_stem}_{named_detection.model_name.lower()}_plate_{index}"
             preprocess_variant_paths = self._save_preprocess_variants(
                 processed_dir=processed_dir,
                 base_name=base_name,
@@ -161,6 +202,23 @@ class ANPRPipeline:
             processed_path = Path(preprocess_variant_paths["thresholded"])
             LOGGER.debug("Saved processed plate %d debug image to %s", index, processed_path)
             ocr_result: OCRResult = self.ocr.extract_text(processed_plate)
+            if enable_comparison:
+                ocr_comparison = OCRComparisonResult(
+                    easyocr_text=self._extract_easyocr_text(cropped_plate),
+                    paddleocr_text=ocr_result.text or "UNREADABLE",
+                    openai_text=self._extract_openai_text(cropped_plate),
+                    disagreement_detected=False,
+                )
+                ocr_comparison.disagreement_detected = self._has_ocr_disagreement(
+                    ocr_comparison
+                )
+            else:
+                ocr_comparison = OCRComparisonResult(
+                    easyocr_text="SKIPPED",
+                    paddleocr_text=ocr_result.text or "UNREADABLE",
+                    openai_text="SKIPPED",
+                    disagreement_detected=False,
+                )
 
             final_text = ocr_result.text or "UNREADABLE"
             comparison_score = self._compute_comparison_score(
@@ -182,6 +240,7 @@ class ANPRPipeline:
                     processed_plate_path=str(processed_path),
                     preprocess_variant_paths=preprocess_variant_paths,
                     ocr_pass_results=ocr_result.pass_results,
+                    ocr_comparison=ocr_comparison,
                 )
             )
             LOGGER.info(
@@ -205,7 +264,7 @@ class ANPRPipeline:
             ).model_name
 
         return ImageResult(
-            image_path=image_path,
+            image_path=image_path or Path(image_name),
             detections=plate_results,
             best_model_name=best_model_name,
         )
@@ -300,6 +359,113 @@ class ANPRPipeline:
         if key == ord("q"):
             return False
         return True
+
+    def show_ocr_comparison_window(self, image_result: ImageResult) -> bool:
+        """Display a side-by-side OCR comparison for the selected plate."""
+        selected_detection = self._best_detection(image_result)
+        if selected_detection is None:
+            return True
+
+        source_image = cv2.imread(str(image_result.image_path))
+        if source_image is None:
+            return True
+
+        overview = source_image.copy()
+        x1, y1, x2, y2 = selected_detection.bbox
+        cv2.rectangle(overview, (x1, y1), (x2, y2), (0, 180, 0), 3)
+        cv2.putText(
+            overview,
+            f"Selected Plate: {selected_detection.model_name}",
+            (max(10, x1), max(30, y1 - 10)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.7,
+            (0, 180, 0),
+            2,
+            cv2.LINE_AA,
+        )
+
+        cropped_plate = source_image[y1:y2, x1:x2].copy()
+        canvas = np.full((720, 1280, 3), 255, dtype=np.uint8)
+        cv2.putText(
+            canvas,
+            "ANPR OCR Comparison",
+            (28, 42),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.9,
+            (40, 40, 40),
+            2,
+            cv2.LINE_AA,
+        )
+        cv2.putText(
+            canvas,
+            image_result.image_path.name,
+            (28, 76),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.7,
+            (90, 90, 90),
+            2,
+            cv2.LINE_AA,
+        )
+
+        overview_panel = self._fit_image(overview, 760, 560)
+        crop_panel = self._fit_image(cropped_plate, 430, 220)
+        canvas[100:100 + overview_panel.shape[0], 24:24 + overview_panel.shape[1]] = overview_panel
+        canvas[110:110 + crop_panel.shape[0], 820:820 + crop_panel.shape[1]] = crop_panel
+        cv2.rectangle(canvas, (810, 100), (1260, 350), (220, 220, 220), 2)
+        cv2.putText(
+            canvas,
+            "Detected Plate",
+            (830, 338),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.7,
+            (60, 60, 60),
+            2,
+            cv2.LINE_AA,
+        )
+
+        text_y = 420
+        line_gap = 52
+        comparison = selected_detection.ocr_comparison
+        overlay_lines = [
+            ("Model 1 : " + comparison.easyocr_text, (255, 0, 0)),
+            ("Model 2 : " + comparison.paddleocr_text, (0, 180, 0)),
+            ("Model 3 : " + comparison.openai_text, (0, 215, 255)),
+        ]
+        for text, color in overlay_lines:
+            cv2.putText(
+                canvas,
+                text[:72],
+                (820, text_y),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.7,
+                color,
+                2,
+                cv2.LINE_AA,
+            )
+            text_y += line_gap
+
+        if comparison.disagreement_detected:
+            cv2.putText(
+                canvas,
+                "OCR disagreement detected",
+                (820, text_y + 10),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.7,
+                (0, 0, 255),
+                2,
+                cv2.LINE_AA,
+            )
+
+        display_image = cv2.resize(
+            canvas,
+            None,
+            fx=0.6,
+            fy=0.6,
+            interpolation=cv2.INTER_AREA,
+        )
+        cv2.imshow("ANPR OCR Comparison", display_image)
+        key = cv2.waitKey(0) & 0xFF
+        return key != ord("q")
 
     def save_process_trace(self, image_result: ImageResult, trace_dir: Path) -> Path | None:
         """Save a step-by-step process board for one image."""
@@ -544,6 +710,104 @@ class ANPRPipeline:
         """Combine detector and OCR confidence into one comparison score."""
         normalized_ocr_confidence = ocr_confidence or 0.0
         return (yolo_confidence * 0.6) + (normalized_ocr_confidence * 0.4)
+
+    @staticmethod
+    def _initialize_easyocr_reader(languages: tuple[str, ...]) -> object | None:
+        """Create an EasyOCR reader when the dependency is available."""
+        try:
+            import easyocr
+        except ImportError:
+            LOGGER.warning("EasyOCR is not available; OCR comparison will mark it unavailable.")
+            return None
+
+        try:
+            return easyocr.Reader(list(languages), gpu=False)
+        except Exception as error:
+            LOGGER.warning("EasyOCR failed to initialize: %s", error)
+            return None
+
+    def _extract_easyocr_text(self, image: np.ndarray) -> str:
+        """Run EasyOCR on the cropped plate for comparison reporting."""
+        if self.easyocr_reader is None:
+            return "UNAVAILABLE"
+
+        try:
+            results = self.easyocr_reader.readtext(image, detail=1)
+        except Exception as error:
+            LOGGER.warning("EasyOCR comparison failed: %s", error)
+            return f"ERROR: {error}"
+
+        fragments = []
+        for result in results:
+            if not isinstance(result, (list, tuple)) or len(result) < 2:
+                continue
+            text = str(result[1]).strip()
+            if text:
+                fragments.append(text)
+        return " ".join(fragments) if fragments else "UNREADABLE"
+
+    @staticmethod
+    def _extract_openai_text(image: np.ndarray) -> str:
+        """Run OpenAI Vision on the cropped plate for comparison reporting."""
+        try:
+            result = interpret_license_plate_image(image)
+        except Exception as error:
+            LOGGER.warning("OpenAI OCR comparison failed: %s", error)
+            return f"ERROR: {error}"
+        return result or "UNREADABLE"
+
+    @staticmethod
+    def _comparison_key(text: str) -> str:
+        """Normalize OCR outputs for simple disagreement checks."""
+        return "".join(char for char in text.upper() if char.isalnum())
+
+    def _has_ocr_disagreement(self, comparison: OCRComparisonResult) -> bool:
+        """Return whether OCR engines produced materially different outputs."""
+        values = {
+            self._comparison_key(comparison.easyocr_text),
+            self._comparison_key(comparison.paddleocr_text),
+            self._comparison_key(comparison.openai_text),
+        }
+        values = {
+            value
+            for value in values
+            if value
+            and value not in {"UNREADABLE", "UNAVAILABLE"}
+            and not value.startswith("ERROR")
+        }
+        return len(values) > 1
+
+    def _best_detection(self, image_result: ImageResult) -> PlateDetectionResult | None:
+        """Return the selected plate detection for an image."""
+        if not image_result.detections:
+            return None
+        if image_result.best_model_name:
+            for detection in image_result.detections:
+                if detection.model_name == image_result.best_model_name:
+                    return detection
+        return image_result.detections[0]
+
+    def _print_ocr_engine_comparison(self, image_result: ImageResult) -> None:
+        """Print a concise OCR engine comparison block for one image."""
+        selected_detection = self._best_detection(image_result)
+        if selected_detection is None:
+            print("\n==============================")
+            print(f"Image: {image_result.image_path.name}")
+            print("------------------------------")
+            print("No license plates detected.")
+            print("==============================")
+            return
+
+        comparison = selected_detection.ocr_comparison
+        print("\n==============================")
+        print(f"Image: {image_result.image_path.name}")
+        print("------------------------------")
+        print(f"Model 1   : {comparison.easyocr_text}")
+        print(f"Model 2   : {comparison.paddleocr_text}")
+        print(f"Model 3   : {comparison.openai_text}")
+        print("==============================")
+        if comparison.disagreement_detected:
+            print("OCR disagreement detected")
 
     @staticmethod
     def _model_display_name(model_name: str) -> str:
