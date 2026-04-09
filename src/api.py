@@ -62,7 +62,6 @@ class ANPRAPIService:
         image_result = self.pipeline.process_array(
             image,
             image_name=image_name,
-            max_detections=1,
             enable_comparison=False,
         )
         if not image_result.detections:
@@ -79,7 +78,7 @@ class ANPRAPIService:
                 "openai_plate": None,
                 "finalized": False,
             }
-        best_detection = image_result.detections[0]
+        best_detection = self._select_best_detection(image_result)
         openai_used = False
         openai_plate: str | None = None
         final_plate = best_detection.text
@@ -118,6 +117,19 @@ class ANPRAPIService:
             "openai_plate": openai_plate,
             "finalized": openai_used or force_finalize,
         }
+
+    @staticmethod
+    def _select_best_detection(image_result: Any) -> Any:
+        """Pick one final detection after OCR scoring, while keeping single-plate output."""
+        if image_result.best_model_name:
+            for detection in image_result.detections:
+                if detection.model_name == image_result.best_model_name:
+                    return detection
+
+        return max(
+            image_result.detections,
+            key=lambda detection: detection.comparison_score,
+        )
 
 
 def emit_message(message: dict[str, Any]) -> None:
